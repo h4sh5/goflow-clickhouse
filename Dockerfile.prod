@@ -6,7 +6,7 @@ ARG src_uri
 RUN apk --update --no-cache add git && \
     go get -u $src_uri
 
-FROM alpine:latest
+FROM alpine:3.15
 ARG src_uri
 
 RUN apk update --no-cache && \
