@@ -8,7 +8,7 @@ WORKDIR /build
 
 RUN go build -ldflags "${LDFLAGS}" -o goflow cmd/goflow/goflow.go
 
-FROM alpine:latest
+FROM alpine:3.18.3
 ARG src_dir
 
 RUN apk update --no-cache && \
