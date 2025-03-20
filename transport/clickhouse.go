@@ -1,215 +1,174 @@
 package transport
 
 import (
-	// "errors"
+	"database/sql"
+	"encoding/binary"
 	"flag"
 	"fmt"
+	"log"
+	"net"
 	"sync"
-	// "os"
-	// "reflect"
-	// "strings"
+	"time"
 
+	"github.com/ClickHouse/clickhouse-go"
 	flowmessage "github.com/cloudflare/goflow/v3/pb"
 	"github.com/cloudflare/goflow/v3/utils"
-
-	"database/sql"
-	"github.com/ClickHouse/clickhouse-go"
-	// proto "github.com/golang/protobuf/proto"
 )
 
-
-
 var (
-	ClickHouseAddr *string
-	ClickHousePort *int
-	ClickHouseUser *string
+	ClickHouseAddr     *string
+	ClickHousePort     *int
+	ClickHouseUser     *string
 	ClickHousePassword *string
 	ClickHouseDatabase *string
-	count uint64
-	tx *sql.Tx
-
-	dbConn *sql.DB
+	dbConn             *sql.DB
 )
 
 type ClickHouseState struct {
 	FixedLengthProto bool
 }
 
-
-
-
 func RegisterFlags() {
-	ClickHouseAddr   = flag.String("ch.addr", "127.0.0.1", "ClickHouse DB Host")
-	ClickHousePort   = flag.Int("ch.port", 9000, "ClickHouse DB port")
-	ClickHouseUser   = flag.String("ch.username", "default", "ClickHouse username")
-	ClickHousePassword   = flag.String("ch.password", "default", "ClickHouse password")
-	ClickHouseDatabase   = flag.String("ch.database", "default", "ClickHouse database")
-
-	// future: add batch size to batch insert
+	ClickHouseAddr = flag.String("ch.addr", "127.0.0.1", "ClickHouse DB Host")
+	ClickHousePort = flag.Int("ch.port", 9000, "ClickHouse DB port")
+	ClickHouseUser = flag.String("ch.username", "default", "ClickHouse username")
+	ClickHousePassword = flag.String("ch.password", "default", "ClickHouse password")
+	ClickHouseDatabase = flag.String("ch.database", "default", "ClickHouse database")
 }
-
 
 func StartClickHouseConnection(logger utils.Logger) (*ClickHouseState, error) {
-		
-	count = 0
+	log.Printf("[INFO] Connecting to ClickHouse at %s:%d\n", *ClickHouseAddr, *ClickHousePort)
 
-	if ClickHouseAddr == nil {
-        temp := "<nil>" // *string cannot be initialized
-        ClickHouseAddr = &temp // in one statement
-    }
+	connStr := fmt.Sprintf("tcp://%s:%d?username=%s&password=%s&database=%s&debug=false",
+		*ClickHouseAddr, *ClickHousePort, *ClickHouseUser, *ClickHousePassword, *ClickHouseDatabase)
 
-	fmt.Printf("clickhouse server on %v:%v\n", *ClickHouseAddr, *ClickHousePort)
-
-	connStr := fmt.Sprintf("tcp://%s:%d?username=%s&password=%s&database=%s&debug=true",
-		 *ClickHouseAddr, *ClickHousePort, *ClickHouseUser, *ClickHousePassword, *ClickHouseDatabase)
-
-
-	// open DB dbConnion stuff
 	connect, err := sql.Open("clickhouse", connStr)
-	dbConn = connect
 	if err != nil {
-		logger.Fatalf("couldn't dbConn to db (%v)", err)
+		logger.Fatalf("[ERROR] Error connecting to ClickHouse: %v", err)
 	}
+	dbConn = connect
+
+	// Test connection
 	if err := dbConn.Ping(); err != nil {
 		if exception, ok := err.(*clickhouse.Exception); ok {
-			fmt.Printf("[%d] %s \n%s\n", exception.Code, exception.Message, exception.StackTrace)
+			log.Printf("[ERROR] ClickHouse Error [%d]: %s\n", exception.Code, exception.Message)
 		} else {
-			fmt.Println(err)
+			log.Println(err)
 		}
-		// return
 	}
 
-	// create DB schema, if not exist 
-	_, err = dbConn.Exec(fmt.Sprintf(`
-		CREATE DATABASE IF NOT EXISTS %s
-	`,  *ClickHouseDatabase))
+	// **CREATE DATABASE (IF NOT EXISTS)**
+	_, err = dbConn.Exec(fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", *ClickHouseDatabase))
 	if err != nil {
-		logger.Fatalf("couldn't create database '%s' (%v)", *ClickHouseDatabase, err)
+		logger.Fatalf("[ERROR] Could not create database '%s': %v", *ClickHouseDatabase, err)
 	}
 
-	// use MergeTree engine to optimize storage
-	//https://clickhouse.tech/docs/en/engines/table-engines/mergetree-family/mergetree/
+	// **CREATE TABLE WITH OPTIMIZATIONS**
 	_, err = dbConn.Exec(fmt.Sprintf(`
-	CREATE TABLE IF NOT EXISTS %s.nflow (
-    
-	    TimeReceived UInt32,
-	    TimeFlowStart UInt32,
-	    TimeFlowEnd UInt32,
-	    Bytes UInt16,
-	    Etype UInt32,
-	    Packets UInt64,
-	    SrcAddr UInt32,
-	    DstAddr UInt32,
-	    SrcPort UInt32,
-	    DstPort UInt32,
-	    Proto UInt32,
-	    SrcMac UInt64,
-	    DstMac UInt64,
-	    SrcVlan UInt32,
-	    DstVlan UInt32,
-	    VlanId UInt32,
-	    FlowType UInt8
-
-	) ENGINE = MergeTree() 
-	ORDER BY (TimeReceived, SrcAddr, SrcPort, DstAddr, DstPort)
-	PARTITION BY DstAddr
-	SAMPLE BY SrcAddr
-	`,  *ClickHouseDatabase))
+	CREATE TABLE IF NOT EXISTS %s.nflow2 (
+    TimeReceived DateTime,  -- ✅ No TTL on primary key
+    TimeFlowStart DateTime,
+    TimeFlowEnd DateTime TTL TimeFlowEnd + INTERVAL 3 MONTH,  -- ✅ Use TTL on TimeFlowEnd instead
+    Bytes UInt32,
+    Etype UInt32,
+    Packets UInt64,
+    SrcAddr UInt32,
+    DstAddr UInt32,
+    SrcPort UInt16,
+    DstPort UInt16,
+    Proto UInt8,
+    SrcMac UInt64,
+    DstMac UInt64,
+    SrcVlan UInt16,
+    DstVlan UInt16,
+    VlanId UInt16,
+    FlowType UInt8,
+    SamplerAddress UInt32
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(TimeReceived)  
+ORDER BY (TimeReceived, SrcAddr, DstAddr, SrcPort, DstPort)  -- ✅ Fix ORDER BY
+SETTINGS index_granularity = 8192;
+`, *ClickHouseDatabase))
 
 	if err != nil {
-		logger.Fatalf("couldn't create table (%v)", err)
+		logger.Fatalf("[ERROR] Could not create table: %v", err)
 	}
 
+	// **OPTIMIZE TABLE (AUTO-INDEXING)**
+	_, err = dbConn.Exec(fmt.Sprintf("OPTIMIZE TABLE %s.nflow2 FINAL", *ClickHouseDatabase))
+	if err != nil {
+		logger.Printf("[WARN] Could not optimize table: %v", err)
+	}
 
-	// start transaction prep
-
-	
-
-	// defer stmt.Close()
-	state := ClickHouseState { FixedLengthProto: true }
-
-	return &state, nil
-
-	
+	log.Println("[INFO] ClickHouse connection established successfully.")
+	return &ClickHouseState{FixedLengthProto: true}, nil
 }
 
-func ipv4BytesToUint32(b []byte) (uint32) {
-	return uint32(b[0]) << 24 + uint32(b[1]) << 16 + uint32(b[2]) << 8 + uint32(b[3])
+// Convert IPv4 address to UInt32 (BigEndian format)
+func ipv4ToUInt32(ip net.IP) uint32 {
+	ip = ip.To4()
+	if ip == nil {
+		return 0
+	}
+	return binary.BigEndian.Uint32(ip)
 }
 
 func ClickHouseInsert(fm *flowmessage.FlowMessage, stmt *sql.Stmt, wg *sync.WaitGroup) {
-	// extract fields out of the flow message
-	
-	
+	// Convert IPv4 to UInt32
+	srcAddr := ipv4ToUInt32(fm.GetSrcAddr())
+	dstAddr := ipv4ToUInt32(fm.GetDstAddr())
+	samplerAddr := ipv4ToUInt32(fm.GetSamplerAddress())
 
-	// assume and encode as IPv4 (even if its v6)
-	srcAddr := ipv4BytesToUint32(fm.GetSrcAddr()[:4])
-	dstAddr := ipv4BytesToUint32(fm.GetDstAddr()[:4])
-	
+	// Logging for debugging
+	log.Printf("[INFO] Flow Inserting: SrcAddr=%s, DstAddr=%s, SamplerAddress=%s, Bytes=%d, Packets=%d, Proto=%d\n",
+		net.IP(fm.GetSrcAddr()), net.IP(fm.GetDstAddr()), net.IP(fm.GetSamplerAddress()),
+		fm.GetBytes(), fm.GetPackets(), fm.GetProto())
 
-	count += 1
-	// fmt.Printf("stmt: %v\n", stmt)
 	if _, err := stmt.Exec(
-		fm.GetTimeReceived(),
-		fm.GetTimeFlowStart(),
-		fm.GetTimeFlowEnd(),
-		fm.GetBytes(),
-		fm.GetEtype(),
-		fm.GetPackets(),
+		time.Unix(int64(fm.GetTimeReceived()), 0),  // Convert to DateTime
+		time.Unix(int64(fm.GetTimeFlowStart()), 0), // Convert to DateTime
+		time.Unix(int64(fm.GetTimeFlowEnd()), 0),   // Convert to DateTime
+		uint32(fm.GetBytes()),
+		uint32(fm.GetEtype()),
+		uint64(fm.GetPackets()),
 		srcAddr,
 		dstAddr,
-		fm.GetSrcPort(),
-		fm.GetDstPort(),
-		fm.GetProto(),
-		fm.GetSrcMac(),
-		fm.GetDstMac(),
-		fm.GetSrcVlan(),
-		fm.GetDstVlan(),
-		fm.GetVlanId(),
+		uint16(fm.GetSrcPort()),
+		uint16(fm.GetDstPort()),
+		uint8(fm.GetProto()),
+		uint64(fm.GetSrcMac()),
+		uint64(fm.GetDstMac()),
+		uint16(fm.GetSrcVlan()),
+		uint16(fm.GetDstVlan()),
+		uint16(fm.GetVlanId()),
 		uint8(fm.GetType()),
+		samplerAddr,
 	); err != nil {
-		fmt.Printf("error inserting record (%v)\n", err)
+		log.Printf("[ERROR] Error inserting record: %v\n", err)
 	}
 
 	wg.Done()
-	
-	// -----------------------------------------------
-
-	fmt.Printf("src (%v) %v:%v\ndst (%v) %v:%v\ncount:%v\n------\n",
-	 	srcAddr,
-	 	fm.GetSrcAddr(), 
-		fm.GetSrcPort(), 
-		dstAddr,
-		fm.GetDstAddr(), 
-		fm.GetDstPort(),
-		count)
-
-
-
 }
 
 func (s ClickHouseState) Publish(msgs []*flowmessage.FlowMessage) {
-	// ht: this is all you need to implement for the transport interface
-	// needs to be async??
-
-	// we need a semaphore / counter that increments inside the goroutines
-	// WaitGroup ~= semaphore
-	
 	var wg sync.WaitGroup
 
-	tx, _  = dbConn.Begin()
-
-	stmt, err := tx.Prepare(fmt.Sprintf(`INSERT INTO %s.nflow(TimeReceived, 
-		TimeFlowStart,TimeFlowEnd,Bytes,Etype,Packets,SrcAddr,DstAddr,SrcPort,
-		DstPort,Proto,SrcMac,DstMac,SrcVlan,DstVlan,VlanId,FlowType) 
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, *ClickHouseDatabase))
-
-	if (err != nil) {
-		fmt.Printf("Couldn't prepare statement (%v)\n", err)
-		// stmt.Close()
+	tx, err := dbConn.Begin()
+	if err != nil {
+		log.Printf("[ERROR] Transaction error: %v\n", err)
 		return
 	}
+	defer tx.Commit()
 
+	stmt, err := tx.Prepare(fmt.Sprintf(`
+		INSERT INTO %s.nflow2 (TimeReceived, TimeFlowStart, TimeFlowEnd, Bytes, Etype, Packets, SrcAddr, DstAddr, SrcPort, DstPort, Proto, SrcMac, DstMac, SrcVlan, DstVlan, VlanId, FlowType, SamplerAddress) 
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, *ClickHouseDatabase))
+
+	if err != nil {
+		log.Printf("[ERROR] Statement preparation error: %v\n", err)
+		return
+	}
+	defer stmt.Close()
 
 	for _, msg := range msgs {
 		wg.Add(1)
@@ -217,16 +176,5 @@ func (s ClickHouseState) Publish(msgs []*flowmessage.FlowMessage) {
 	}
 
 	wg.Wait()
-	defer stmt.Close()
-
-	if err := tx.Commit(); err != nil {
-		fmt.Printf("Couldn't commit transactions (%v)\n", err)
-	}
-
-
-
-	
-	// commit after all of those are inserted 
-	// fmt.Println("\noutside loop!\n")
-
+	log.Println("[INFO] Batch insert completed.")
 }
